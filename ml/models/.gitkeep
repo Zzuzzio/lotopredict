@@ -1,0 +1,3 @@
+# Keep model directory in git (models are generated locally)
+*
+!.gitkeep

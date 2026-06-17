@@ -1,0 +1,14 @@
+{
+  "name": "lotopredict-browser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch": "node fetch_archive.js"
+  },
+  "dependencies": {
+    "playwright": "1.39.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
