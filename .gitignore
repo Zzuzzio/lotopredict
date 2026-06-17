@@ -4,6 +4,8 @@
 /browser/.node-bin
 /ml/venv/
 /ml/.python-bin
+/ml/__pycache__/
+*.pyc
 /storage/lotopredict.sqlite
 /storage/logs/*
 !/storage/logs/.gitkeep
