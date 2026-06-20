@@ -65,6 +65,27 @@ php bin/fetch_draws.php --lottery=gosloto-6x45 --backfill
 
 **Лотереи:** Гослото 6 из 45, 7 из 49, 5 из 36 (`5x36plus`).
 
+## 5 из 36 — полный парсинг (мощный сервер)
+
+```bash
+# Первичная настройка сервера (PHP, SQLite, Playwright)
+bash bin/setup_server.sh
+
+# Статус базы и JSONL-архива
+php bin/fetch_5x36plus.php --status
+
+# Последние тиражи (cron каждые 6 ч)
+php bin/fetch_5x36plus.php --recent
+
+# Полный архив с 1-го тиража (browser + parallel backfill, ~160k тиражей)
+php bin/fetch_5x36plus.php --full
+
+# Только curl (если browser недоступен)
+php bin/fetch_5x36plus.php --full --curl-only
+```
+
+На мощном сервере (4+ ядра, 8 GB RAM) используется профиль: `parallel=50`, `page_size=100`, browser backfill `parallel=40`.
+
 ## Источник данных
 
 Тиражи загружаются с API Столото (тот же endpoint, что использует бесконечная прокрутка архива):

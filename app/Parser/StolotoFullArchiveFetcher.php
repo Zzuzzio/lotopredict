@@ -22,15 +22,21 @@ class StolotoFullArchiveFetcher
     /** @var int */
     private $parallel;
 
-    public function __construct()
+    public function __construct(array $overrides = [])
     {
         $config = require dirname(__DIR__, 2) . '/config/app.php';
         $this->client = new StolotoClient();
         $this->exporter = new StolotoArchiveExporter($this->client);
         $this->logPath = $config['log_path'];
-        $this->delayMs = isset($config['full_archive_delay_ms']) ? (int) $config['full_archive_delay_ms'] : 150;
-        $this->pageSize = isset($config['full_archive_page_size']) ? (int) $config['full_archive_page_size'] : 100;
-        $this->parallel = isset($config['full_archive_parallel']) ? (int) $config['full_archive_parallel'] : 20;
+        $this->delayMs = isset($overrides['delay_ms'])
+            ? (int) $overrides['delay_ms']
+            : (isset($config['full_archive_delay_ms']) ? (int) $config['full_archive_delay_ms'] : 150);
+        $this->pageSize = isset($overrides['page_size'])
+            ? (int) $overrides['page_size']
+            : (isset($config['full_archive_page_size']) ? (int) $config['full_archive_page_size'] : 100);
+        $this->parallel = isset($overrides['parallel'])
+            ? (int) $overrides['parallel']
+            : (isset($config['full_archive_parallel']) ? (int) $config['full_archive_parallel'] : 20);
     }
 
     /**

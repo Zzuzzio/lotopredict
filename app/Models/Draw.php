@@ -70,6 +70,16 @@ class Draw
         return $row && $row['max_num'] !== null ? (int) $row['max_num'] : null;
     }
 
+    public static function getMinDrawNumber($lotteryId)
+    {
+        $stmt = Connection::get()->prepare(
+            'SELECT MIN(draw_number) AS min_num FROM draws WHERE lottery_id = :lottery_id'
+        );
+        $stmt->execute(['lottery_id' => $lotteryId]);
+        $row = $stmt->fetch();
+        return $row && $row['min_num'] !== null ? (int) $row['min_num'] : null;
+    }
+
     public static function count($lotteryId)
     {
         $stmt = Connection::get()->prepare(

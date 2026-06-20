@@ -78,6 +78,10 @@ class DrawNormalizer
     {
         $value = trim($value);
 
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/', $value, $m)) {
+            return sprintf('%s-%s-%s %s:%s:%s', $m[1], $m[2], $m[3], $m[4], $m[5], $m[6]);
+        }
+
         if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?$/', $value, $m)) {
             $time = sprintf(
                 '%s:%s:%s',

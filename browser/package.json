@@ -6,7 +6,7 @@
     "fetch": "node fetch_archive.js"
   },
   "dependencies": {
-    "playwright": "1.39.0"
+    "playwright": "1.49.0"
   },
   "engines": {
     "node": ">=16"

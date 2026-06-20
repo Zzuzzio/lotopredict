@@ -80,7 +80,12 @@ class FetchService
             $useBrowser = $this->useBrowser && $this->browserClient !== null && !$curlOnly && !$preferCurl;
 
             if ($useBrowser) {
-                $archiveResult = $this->browserClient->fetchFullArchive($lottery['stoloto_game'], $pageSize);
+                $browserOpts = $this->getBrowserOverrides($lotteryConfig);
+                $archiveResult = $this->browserClient->fetchFullArchive(
+                    $lottery['stoloto_game'],
+                    $pageSize,
+                    $browserOpts
+                );
                 $browserFailed = in_array(
                     $archiveResult['stopped_reason'],
                     ['exception', 'browser_error', 'launch_error', 'invalid_json'],
@@ -96,7 +101,7 @@ class FetchService
             if (!$useBrowser) {
                 $source = 'curl_full';
                 $seedMax = Draw::getMaxDrawNumber((int) $lottery['id']);
-                $fetcher = new StolotoFullArchiveFetcher();
+                $fetcher = new StolotoFullArchiveFetcher($this->getFetcherOverrides($lotteryConfig));
                 $curlResult = $fetcher->fetch($lottery['stoloto_game'], $jsonlFile, $progressFile, $seedMax);
                 $archiveResult = [
                     'draws' => [],
@@ -167,6 +172,12 @@ class FetchService
             return ['saved' => 0, 'skipped' => 0, 'errors' => 1, 'fetched' => 0];
         }
 
+        // Batch upserts in transactions — without this each row commits separately
+        // (per-row fsync), making large imports (160k+) take ~45+ minutes.
+        $pdo = \App\Database\Connection::get();
+        $batchSize = 2000;
+        $pdo->beginTransaction();
+
         while (($line = fgets($handle)) !== false) {
             $line = trim($line);
             if ($line === '') {
@@ -185,9 +196,15 @@ class FetchService
             $skipped += $result['skipped'];
             $errors += $result['errors'];
 
-            if ($fetched % 5000 === 0) {
+            if ($fetched % $batchSize === 0) {
+                $pdo->commit();
+                $pdo->beginTransaction();
                 $this->log('Import progress: ' . $fetched . ' lines from ' . basename($jsonlPath));
             }
+        }
+
+        if ($pdo->inTransaction()) {
+            $pdo->commit();
         }
 
         fclose($handle);
@@ -197,11 +214,57 @@ class FetchService
 
     private function getMinDrawNumber($lotteryId)
     {
-        $pdo = \App\Database\Connection::get();
-        $stmt = $pdo->prepare('SELECT MIN(draw_number) FROM draws WHERE lottery_id = ?');
-        $stmt->execute([$lotteryId]);
-        $val = $stmt->fetchColumn();
-        return $val !== false ? (int) $val : null;
+        return Draw::getMinDrawNumber($lotteryId);
+    }
+
+    /**
+     * @param array $lotteryConfig
+     * @return array{parallel?: int, page_size?: int, delay_ms?: int}
+     */
+    private function getFetcherOverrides(array $lotteryConfig)
+    {
+        $overrides = [];
+
+        if (!empty($lotteryConfig['fetch_parallel'])) {
+            $overrides['parallel'] = (int) $lotteryConfig['fetch_parallel'];
+        }
+        if (!empty($lotteryConfig['fetch_page_size'])) {
+            $overrides['page_size'] = (int) $lotteryConfig['fetch_page_size'];
+        }
+        if (isset($lotteryConfig['fetch_delay_ms'])) {
+            $overrides['delay_ms'] = (int) $lotteryConfig['fetch_delay_ms'];
+        }
+
+        return $overrides;
+    }
+
+    /**
+     * @param array $lotteryConfig
+     * @return array{parallel?: int, delay_ms?: int, target_min?: int}
+     */
+    private function getBrowserOverrides(array $lotteryConfig)
+    {
+        $config = require dirname(__DIR__, 2) . '/config/app.php';
+        $overrides = [
+            'parallel' => isset($config['full_archive_browser_parallel'])
+                ? (int) $config['full_archive_browser_parallel']
+                : 30,
+            'delay_ms' => isset($config['full_archive_browser_delay_ms'])
+                ? (int) $config['full_archive_browser_delay_ms']
+                : 600,
+        ];
+
+        if (!empty($lotteryConfig['fetch_browser_parallel'])) {
+            $overrides['parallel'] = (int) $lotteryConfig['fetch_browser_parallel'];
+        }
+        if (isset($lotteryConfig['fetch_browser_delay_ms'])) {
+            $overrides['delay_ms'] = (int) $lotteryConfig['fetch_browser_delay_ms'];
+        }
+        if (!empty($lotteryConfig['first_draw_number'])) {
+            $overrides['target_min'] = (int) $lotteryConfig['first_draw_number'];
+        }
+
+        return $overrides;
     }
 
     /**

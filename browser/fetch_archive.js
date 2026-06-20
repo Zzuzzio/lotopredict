@@ -29,6 +29,9 @@ function parseArgs(argv) {
     maxStale: 0,
     retries: 5,
     targetMin: 1,
+    parallel: 30,
+    refreshEvery: 25,
+    maxBlockRetries: 8,
   };
 
   for (const arg of argv) {
@@ -45,6 +48,9 @@ function parseArgs(argv) {
     else if (arg.startsWith('--max-stale=')) opts.maxStale = parseInt(arg.slice(12), 10);
     else if (arg.startsWith('--retries=')) opts.retries = parseInt(arg.slice(10), 10);
     else if (arg.startsWith('--target-min=')) opts.targetMin = parseInt(arg.slice(13), 10);
+    else if (arg.startsWith('--parallel=')) opts.parallel = parseInt(arg.slice(11), 10);
+    else if (arg.startsWith('--refresh-every=')) opts.refreshEvery = parseInt(arg.slice(16), 10);
+    else if (arg.startsWith('--max-block-retries=')) opts.maxBlockRetries = parseInt(arg.slice(20), 10);
   }
 
   if (opts.mode === 'full' || opts.pages === 0) {
@@ -225,6 +231,239 @@ async function scrollPage(page) {
   }
 }
 
+/**
+ * Capture the signed `gosloto-partner` header (+ device headers) from the site's
+ * own archive XHR. Without it the API returns 403 "Failed retrieved partner".
+ */
+async function captureApiHeaders(page, game, opts) {
+  let captured = null;
+
+  const onRequest = (req) => {
+    const u = req.url();
+    if (captured) return;
+    if (u.includes('/draws/archive') && u.includes(`game=${encodeURIComponent(game)}`)) {
+      const h = req.headers();
+      if (h['gosloto-partner']) {
+        captured = {
+          'gosloto-partner': h['gosloto-partner'],
+          'device-type': h['device-type'] || 'STOLOTO',
+          'device-platform': h['device-platform'] || 'DESKTOP',
+          'accept-language': h['accept-language'] || 'ru-RU',
+          'content-type': h['content-type'] || 'application/x-www-form-urlencoded',
+          referer: h['referer'] || opts.url,
+        };
+      }
+    }
+  };
+
+  page.on('request', onRequest);
+
+  for (let i = 0; i < 15 && !captured; i++) {
+    await page.mouse.wheel(0, 4000);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+
+  page.off('request', onRequest);
+  return captured;
+}
+
+/**
+ * Fetch a wave of archive pages in parallel using the captured partner header.
+ * Server caps count at 50, so pageSize is forced to <= 50.
+ */
+async function fetchPagesBatch(page, game, headers, pageNumbers, pageSize) {
+  return page.evaluate(
+    async ({ game, headers, pageNumbers, pageSize }) => {
+      const out = await Promise.all(
+        pageNumbers.map(async (pg) => {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              const res = await fetch(
+                `/p/api/mobile/api/v35/service/draws/archive?game=${encodeURIComponent(game)}&count=${pageSize}&page=${pg}`,
+                { credentials: 'include', headers }
+              );
+              if (res.status === 403) {
+                return { pg, blocked: true, draws: [], hasMore: true };
+              }
+              if (!res.ok) {
+                await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+                continue;
+              }
+              const d = await res.json();
+              if (d.requestStatus !== 'success') {
+                return { pg, blocked: true, draws: [], hasMore: true };
+              }
+              return { pg, blocked: false, draws: d.draws || [], hasMore: Boolean(d.hasMore) };
+            } catch (e) {
+              await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+            }
+          }
+          return { pg, blocked: false, draws: [], hasMore: true, failed: true };
+        })
+      );
+      return out;
+    },
+    { game, headers, pageNumbers, pageSize }
+  );
+}
+
+/**
+ * Primary fast strategy: capture partner header, then pull archive pages in
+ * parallel waves until an empty/short page marks the end of the archive.
+ */
+async function fetchArchiveParallel(page, game, collector, opts) {
+  const pageSize = Math.min(50, opts.count || 50);
+  let headers = await captureApiHeaders(page, game, opts);
+  if (!headers) {
+    logProgress('parallel: failed to capture gosloto-partner header, falling back to scroll');
+    return { ok: false, stoppedReason: 'no_partner_header' };
+  }
+
+  logProgress(`parallel: captured partner header, page_size=${pageSize} parallel=${opts.parallel}`);
+
+  const refreshEvery = opts.refreshEvery > 0 ? opts.refreshEvery : 25;
+  const maxBlockRetries = opts.maxBlockRetries > 0 ? opts.maxBlockRetries : 8;
+
+  let nextPage = 1;
+  let stoppedReason = 'archive_complete';
+  let consecutiveEmpty = 0;
+  let waveCount = 0;
+  // Stoloto's archive API caps at ~25k recent draws, then clamps to the last
+  // page (repeats the same oldest rows with hasMore=true). Detect the clamp:
+  // if the minimum draw number returned stops decreasing across waves, stop.
+  let prevWaveMin = null;
+  let stalledWaves = 0;
+  const maxStalledWaves = 4;
+
+  while (true) {
+    // Proactively refresh the partner header — the token rotates over time and
+    // sustained use triggers Qrator throttling.
+    if (waveCount > 0 && waveCount % refreshEvery === 0) {
+      const fresh = await captureApiHeaders(page, game, opts);
+      if (fresh) {
+        headers = fresh;
+        logProgress(`parallel: proactive header refresh @wave${waveCount}`);
+      }
+    }
+
+    const wave = [];
+    for (let i = 0; i < opts.parallel; i++) {
+      wave.push(nextPage + i);
+    }
+
+    let results = await fetchPagesBatch(page, game, headers, wave, pageSize);
+    let blockedCount = results.filter((r) => r.blocked).length;
+
+    // Rate-limited / token expired: back off, reload, re-capture, retry SAME wave.
+    let blockRetry = 0;
+    while (blockedCount >= Math.ceil(wave.length / 2) && blockRetry < maxBlockRetries) {
+      blockRetry++;
+      const backoff = Math.min(60000, 4000 * blockRetry);
+      logProgress(
+        `parallel: ${blockedCount}/${wave.length} blocked @page${nextPage}, backoff ${backoff}ms (retry ${blockRetry}/${maxBlockRetries})`
+      );
+      await page.waitForTimeout(backoff);
+      await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: 120000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+      const fresh = await captureApiHeaders(page, game, opts);
+      if (fresh) {
+        headers = fresh;
+      }
+      results = await fetchPagesBatch(page, game, headers, wave, pageSize);
+      blockedCount = results.filter((r) => r.blocked).length;
+    }
+
+    // Still blocked after all retries — stop gracefully so --resume can continue.
+    if (blockedCount >= Math.ceil(wave.length / 2)) {
+      writeProgressFile(opts.progress, collector.stats());
+      logProgress(`parallel: still blocked after ${maxBlockRetries} retries, stopping for resume`);
+      return { ok: true, stoppedReason: 'rate_limited', pagesFetched: collector.apiPages };
+    }
+
+    let waveAdded = 0;
+    let shortPage = false;
+    let pagesWithData = 0;
+    let emptyApiPages = 0;
+    let waveMin = null;
+    for (const r of results) {
+      if (r.draws && r.draws.length > 0) {
+        pagesWithData++;
+        waveAdded += collector.addAll(r.draws);
+        for (const d of r.draws) {
+          const n = d && d.number;
+          if (n && (waveMin === null || n < waveMin)) {
+            waveMin = n;
+          }
+        }
+        if (r.draws.length < pageSize || r.hasMore === false) {
+          shortPage = true;
+        }
+      } else if (!r.blocked) {
+        emptyApiPages++;
+      }
+    }
+
+    // Clamp detection: the lowest draw number returned didn't drop vs prior wave.
+    if (waveMin !== null && pagesWithData > 0) {
+      if (prevWaveMin !== null && waveMin >= prevWaveMin) {
+        stalledWaves++;
+        if (stalledWaves >= maxStalledWaves) {
+          stoppedReason = 'archive_limit_reached';
+          collector.apiPages = nextPage + opts.parallel - 1;
+          writeProgressFile(opts.progress, collector.stats());
+          logProgress(
+            `parallel: archive API limit reached at draw #${collector.minNumber()} (API clamps older pages), stopping`
+          );
+          break;
+        }
+      } else {
+        stalledWaves = 0;
+        prevWaveMin = waveMin;
+      }
+    }
+
+    // Only stop at the real archive boundary (short/empty pages), not on
+    // already-seen pages (waveAdded === 0 during --resume rescan).
+    if (pagesWithData === 0 && emptyApiPages > 0) {
+      consecutiveEmpty++;
+      if (consecutiveEmpty >= 2) {
+        stoppedReason = 'no_more';
+        break;
+      }
+    } else {
+      consecutiveEmpty = 0;
+    }
+
+    collector.apiPages = nextPage + opts.parallel - 1;
+    nextPage += opts.parallel;
+    waveCount++;
+
+    writeProgressFile(opts.progress, collector.stats());
+    logProgress(
+      `parallel wave→page${nextPage - 1}: +${waveAdded} total=${collector.count()} min=${collector.minNumber()} max=${collector.maxNumber()}`
+    );
+
+    if (shortPage) {
+      stoppedReason = 'archive_complete';
+      break;
+    }
+
+    const minDraw = collector.minNumber();
+    if (minDraw !== null && minDraw <= opts.targetMin) {
+      stoppedReason = 'reached_first_draw';
+      break;
+    }
+
+    if (opts.delay > 0) {
+      await page.waitForTimeout(opts.delay);
+    }
+  }
+
+  writeProgressFile(opts.progress, collector.stats());
+  return { ok: true, stoppedReason, pagesFetched: collector.apiPages };
+}
+
 async function fetchDrawByNumber(page, game, drawNumber) {
   return page.evaluate(
     async ({ game, drawNumber }) => {
@@ -247,6 +486,81 @@ async function fetchDrawByNumber(page, game, drawNumber) {
     },
     { game, drawNumber }
   );
+}
+
+async function fetchDrawsByNumbersBatch(page, game, drawNumbers) {
+  return page.evaluate(
+    async ({ game, drawNumbers }) => {
+      const results = await Promise.all(
+        drawNumbers.map(async (drawNumber) => {
+          try {
+            const apiUrl = `/p/api/mobile/api/v35/service/draws/${drawNumber}?game=${encodeURIComponent(game)}`;
+            const res = await fetch(apiUrl, {
+              credentials: 'include',
+              headers: { Accept: 'application/json' },
+            });
+            if (!res.ok) return null;
+            const data = await res.json();
+            if (data.requestStatus !== 'success' || !data.draw) return null;
+            return data.draw;
+          } catch (e) {
+            return null;
+          }
+        })
+      );
+      return results.filter(Boolean);
+    },
+    { game, drawNumbers }
+  );
+}
+
+async function parallelBackfill(page, game, collector, opts) {
+  const minDraw = collector.minNumber();
+  if (minDraw === null || minDraw <= opts.targetMin) {
+    return 0;
+  }
+
+  const batchSize = Math.max(1, opts.parallel);
+  let addedTotal = 0;
+  let emptyBatches = 0;
+
+  for (let start = minDraw - 1; start >= opts.targetMin; start -= batchSize) {
+    const batch = [];
+    for (let n = start; n > start - batchSize && n >= opts.targetMin; n--) {
+      if (!collector.seen.has(n)) {
+        batch.push(n);
+      }
+    }
+
+    if (batch.length === 0) {
+      continue;
+    }
+
+    const draws = await fetchDrawsByNumbersBatch(page, game, batch);
+    const added = collector.addAll(draws);
+
+    if (added === 0) {
+      emptyBatches++;
+      if (emptyBatches >= 8) {
+        logProgress(`parallel backfill stopped after ${emptyBatches} empty batches @${start}`);
+        break;
+      }
+    } else {
+      emptyBatches = 0;
+      addedTotal += added;
+    }
+
+    if (start % 5000 < batchSize || start <= opts.targetMin + batchSize) {
+      logProgress(
+        `parallel backfill @${start}: +${added} total=${collector.count()} min=${collector.minNumber()}`
+      );
+      writeProgressFile(opts.progress, collector.stats());
+    }
+
+    await page.waitForTimeout(Math.max(200, opts.delay / 2));
+  }
+
+  return addedTotal;
 }
 
 async function tryDownloadArchive(page, collector) {
@@ -412,16 +726,20 @@ async function fetchArchiveFull(page, game, countPerPage, delayMs, collector, op
       staleRounds++;
 
       const minDraw = collector.minNumber();
-      if (minDraw !== null && minDraw > opts.targetMin && staleRounds % 3 === 0) {
-        for (let n = minDraw - 1; n >= Math.max(opts.targetMin, minDraw - 20); n--) {
-          const one = await fetchDrawByNumber(page, game, n);
-          if (one.ok && one.draw) {
-            collector.add(one.draw);
+      if (minDraw !== null && minDraw > opts.targetMin && staleRounds % 2 === 0) {
+        const batch = [];
+        const batchSize = Math.max(1, opts.parallel);
+        for (let n = minDraw - 1; n >= Math.max(opts.targetMin, minDraw - batchSize); n--) {
+          if (!collector.seen.has(n)) {
+            batch.push(n);
           }
-          await page.waitForTimeout(400);
         }
-        if (collector.count() > after) {
-          staleRounds = 0;
+        if (batch.length > 0) {
+          const draws = await fetchDrawsByNumbersBatch(page, game, batch);
+          const added = collector.addAll(draws);
+          if (added > 0) {
+            staleRounds = 0;
+          }
         }
       }
 
@@ -465,6 +783,11 @@ async function fetchArchiveFull(page, game, countPerPage, delayMs, collector, op
   }
 
   page.off('response', onResponse);
+
+  if (collector.minNumber() !== null && collector.minNumber() > opts.targetMin) {
+    logProgress(`starting parallel backfill (parallel=${opts.parallel})`);
+    await parallelBackfill(page, game, collector, opts);
+  }
 
   if (stoppedReason === 'stale_scroll' && collector.count() > 0 && !hasMoreFlag) {
     stoppedReason = 'no_more';
@@ -526,7 +849,19 @@ async function main() {
     let result;
 
     if (opts.mode === 'full') {
-      result = await fetchArchiveFull(page, opts.game, opts.count, opts.delay, collector, opts);
+      // Fast path: parallel page fetch with captured partner header.
+      const parallelRes = await fetchArchiveParallel(page, opts.game, collector, opts);
+      if (parallelRes.ok) {
+        result = {
+          pagesFetched: parallelRes.pagesFetched || collector.apiPages,
+          scrollRounds: collector.scrollRounds,
+          stoppedReason: parallelRes.stoppedReason,
+        };
+      } else {
+        // Fallback: original scroll + intercept strategy.
+        logProgress('falling back to scroll strategy');
+        result = await fetchArchiveFull(page, opts.game, opts.count, opts.delay, collector, opts);
+      }
     } else {
       result = await fetchArchivePaginated(
         page,

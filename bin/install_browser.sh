@@ -61,7 +61,7 @@ if [ "$NODE_MAJOR" -lt 16 ]; then
 fi
 
 echo "==> Installing Chromium system dependencies (apt)..."
-DEPS="libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 fonts-liberation libdrm2 libxshmfence1 libgtk-3-0"
+DEPS="libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libasound2 libdrm2 libxshmfence1 libgtk-3-0"
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq || true
   apt-get install -y -qq $DEPS || echo "WARN: some apt packages failed; chromium may not start"

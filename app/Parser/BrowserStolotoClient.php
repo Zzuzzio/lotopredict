@@ -21,11 +21,19 @@ class BrowserStolotoClient
      *
      * @return array{draws: array, pages_fetched: int, scroll_rounds: int, stopped_reason: string, jsonl: string|null, total_draws: int}
      */
-    public function fetchFullArchive($stolotoGame, $countPerPage = 50)
+    public function fetchFullArchive($stolotoGame, $countPerPage = 50, array $browserOpts = [])
     {
         $archiveUrl = $this->getArchiveUrl($stolotoGame);
         $config = require dirname(__DIR__, 2) . '/config/app.php';
-        $delay = isset($config['full_archive_delay_ms']) ? (int) $config['full_archive_delay_ms'] : 2500;
+        $delay = isset($browserOpts['delay_ms'])
+            ? (int) $browserOpts['delay_ms']
+            : (isset($config['full_archive_browser_delay_ms']) ? (int) $config['full_archive_browser_delay_ms'] : 2500);
+        $parallel = isset($browserOpts['parallel'])
+            ? (int) $browserOpts['parallel']
+            : (isset($config['full_archive_browser_parallel']) ? (int) $config['full_archive_browser_parallel'] : 30);
+        $targetMin = isset($browserOpts['target_min']) ? (int) $browserOpts['target_min'] : 1;
+        $refreshEvery = isset($browserOpts['refresh_every']) ? (int) $browserOpts['refresh_every'] : 25;
+        $maxBlockRetries = isset($browserOpts['max_block_retries']) ? (int) $browserOpts['max_block_retries'] : 8;
         $storageDir = dirname(__DIR__, 2) . '/storage/logs';
 
         $jsonlFile = $storageDir . '/archive_' . $stolotoGame . '.jsonl';
@@ -35,12 +43,16 @@ class BrowserStolotoClient
         $resume = is_file($jsonlFile) && filesize($jsonlFile) > 0 ? '--resume' : '';
 
         $cmd = sprintf(
-            '%s --mode=full --game=%s --url=%s --count=%d --delay=%d --jsonl=%s --progress=%s %s --out=%s 2>>%s',
+            '%s --mode=full --game=%s --url=%s --count=%d --delay=%d --parallel=%d --target-min=%d --refresh-every=%d --max-block-retries=%d --jsonl=%s --progress=%s %s --out=%s 2>>%s',
             escapeshellarg($this->runScript),
             escapeshellarg($stolotoGame),
             escapeshellarg($archiveUrl),
             (int) $countPerPage,
             (int) $delay,
+            (int) $parallel,
+            (int) $targetMin,
+            (int) $refreshEvery,
+            (int) $maxBlockRetries,
             escapeshellarg($jsonlFile),
             escapeshellarg($progressFile),
             $resume,

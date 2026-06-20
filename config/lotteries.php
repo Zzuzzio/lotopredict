@@ -28,6 +28,15 @@ return [
         'bonus_count' => 1,
         'bonus_max_number' => 4,
         'archive_url' => 'https://www.stoloto.ru/5x36plus/archive',
-        'archive_page_size' => 50,
+        'archive_page_size' => 100,
+        'first_draw_number' => 1,
+        // Server-tuned fetch profile (see config/app.php).
+        // Browser profile is throttled to stay under Qrator rate limits while
+        // still pulling ~1000 draws/wave; backoff+resume handles any blocks.
+        'fetch_parallel' => 50,
+        'fetch_page_size' => 100,
+        'fetch_delay_ms' => 80,
+        'fetch_browser_parallel' => 20,
+        'fetch_browser_delay_ms' => 1500,
     ],
 ];
